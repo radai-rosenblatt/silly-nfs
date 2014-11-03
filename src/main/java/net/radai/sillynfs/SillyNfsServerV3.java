@@ -59,6 +59,8 @@ import org.dcache.nfs.v3.xdr.LOOKUP3resfail;
 import org.dcache.nfs.v3.xdr.LOOKUP3resok;
 import org.dcache.nfs.v3.xdr.MKDIR3args;
 import org.dcache.nfs.v3.xdr.MKDIR3res;
+import org.dcache.nfs.v3.xdr.MKDIR3resfail;
+import org.dcache.nfs.v3.xdr.MKDIR3resok;
 import org.dcache.nfs.v3.xdr.MKNOD3args;
 import org.dcache.nfs.v3.xdr.MKNOD3res;
 import org.dcache.nfs.v3.xdr.PATHCONF3args;
@@ -251,8 +253,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
             res.status = nfsstat.NFS_OK;
             res.resok = new LOOKUP3resok();
-            res.resok.object = toHandle(childInodeNumber, childInode);
-
+            res.resok.object = toHandle(childInodeNumber);
             res.resok.obj_attributes = toPostOp(childInodeNumber, childInode);
             res.resok.dir_attributes = toPostOp(parentInodeNumber, parentInode);
 
@@ -394,17 +395,26 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     public CREATE3res NFSPROC3_CREATE_3(RpcCall call$, CREATE3args arg1) {
         CREATE3res res = new CREATE3res();
 
+        long parentInodeNumber = -1;
+        SillyInode parentInode = null;
+        pre_op_attr parentPre = null;
         try {
             int creationMode = arg1.how.mode;
             String path = arg1.where.name.value;
-            checkFilename(path);
             SillyInodeReference parentRef = new SillyInodeReference(arg1.where.dir.data);
-            long parentInodeNumber = parentRef.getInodeNumber();
-            SillyInode parentInode = resolve(parentRef);
+            parentInodeNumber = parentRef.getInodeNumber();
+            parentInode = resolve(parentRef);
             if (!parentInode.isDirectory()) {
                 throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
             }
-            pre_op_attr parentPre = toPreAttr(parentInode);
+            parentPre = toPreAttr(parentInode);
+
+            //check names after we resolve parent so that we could fill in wcc data on failure result
+            checkFilename(path);
+            if (path.equals(".") || path.equals("..")) {
+                throw new ExistException();
+            }
+
             ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber);
 
             long serverTime = System.currentTimeMillis();
@@ -419,6 +429,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 case createmode3.UNCHECKED:
                 case createmode3.GUARDED:
                     sattr3 creationAttributes = arg1.how.obj_attributes;
+                    //noinspection OctalInteger
                     mode = creationAttributes.mode.set_it ? creationAttributes.mode.mode.value.value&Stat.S_PERMS : 0644;
                     uid = creationAttributes.uid.set_it ? creationAttributes.uid.uid.value.value : 0; //TODO - use caller
                     gid = creationAttributes.gid.set_it ? creationAttributes.gid.gid.value.value : 0; //TODO - use caller
@@ -458,26 +469,37 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 inodeTable.put(newInodeNumber, newInode);
             }
 
-            //TODO - update timestamps on parent
+            //TODO - update timestamps and size on parent
 
             res.status = nfsstat.NFS_OK;
             res.resok = new CREATE3resok();
             res.resok.obj_attributes = toPostOp(newInodeNumber, newInode);
-            res.resok.obj = new post_op_fh3();
-            res.resok.obj.handle_follows = true;
-            res.resok.obj.handle = new nfs_fh3();
-            res.resok.obj.handle.data = SillyInodeReference.produceFor(newInodeNumber);
+            res.resok.obj = toPostOpHandle(newInodeNumber);
             res.resok.dir_wcc = new wcc_data();
             res.resok.dir_wcc.before = parentPre;
             res.resok.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
 
         } catch (ChimeraNFSException hne) {
             res.status = hne.getStatus();
-            res.resfail = CONST_CREATE_FAIL_RES;
+            if (parentPre == null) {
+                res.resfail = CONST_CREATE_FAIL_RES;
+            } else {
+                res.resfail = new CREATE3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
         } catch (Exception e) {
             logger.error("create", e);
             res.status = nfsstat.NFSERR_SERVERFAULT;
-            res.resfail = CONST_CREATE_FAIL_RES;
+            if (parentPre == null) {
+                res.resfail = CONST_CREATE_FAIL_RES;
+            } else {
+                res.resfail = new CREATE3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
         }
 
         return res;
@@ -485,7 +507,88 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public MKDIR3res NFSPROC3_MKDIR_3(RpcCall call$, MKDIR3args arg1) {
-        return null;
+        MKDIR3res res = new MKDIR3res();
+
+        long parentInodeNumber = -1;
+        SillyInode parentInode = null;
+        pre_op_attr parentPre = null;
+        try {
+            String path = arg1.where.name.value;
+
+            SillyInodeReference parentRef = new SillyInodeReference(arg1.where.dir.data);
+            parentInodeNumber = parentRef.getInodeNumber();
+            parentInode = resolve(parentRef);
+            if (!parentInode.isDirectory()) {
+                throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
+            }
+            parentPre = toPreAttr(parentInode);
+
+            //check names after we resolve parent so that we could fill in wcc data on failure result
+            checkFilename(path);
+            if (path.equals(".") || path.equals("..")) {
+                throw new ExistException();
+            }
+
+            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber);
+
+            sattr3 creationAttributes = arg1.attributes;
+            long serverTime = System.currentTimeMillis();
+            //noinspection OctalInteger
+            int mode = creationAttributes.mode.set_it ? creationAttributes.mode.mode.value.value&Stat.S_PERMS : 0644;
+            int uid = creationAttributes.uid.set_it ? creationAttributes.uid.uid.value.value : 0; //TODO - use caller
+            int gid = creationAttributes.gid.set_it ? creationAttributes.gid.gid.value.value : 0; //TODO - use caller
+            long size = 0; //dir size == number of children, created empty
+            long accessTime = creationAttributes.atime.set_it == time_how.SET_TO_CLIENT_TIME ? HimeraNfsUtils.convertTimestamp(creationAttributes.atime.atime) : serverTime;
+            long modificationTime = creationAttributes.mtime.set_it == time_how.SET_TO_CLIENT_TIME ? HimeraNfsUtils.convertTimestamp(creationAttributes.mtime.mtime) : serverTime;
+
+            //optimistic approach - create the new inode, try inserting it.
+            long newInodeNumber = inodeSequence.incrementAndGet();
+            SillyInode newInode = createInode(newInodeNumber, parentInodeNumber, mode, Stat.Type.DIRECTORY, uid, gid, size, accessTime, modificationTime);
+            Long existingInodeNumber = parentDirectoryEntry.putIfAbsent(path, newInodeNumber);
+            if (existingInodeNumber != null) {
+                //optimistic failure
+                //bonus points - attempt to reclaim inode number
+                inodeSequence.compareAndSet(newInodeNumber, newInodeNumber-1);
+                throw new ExistException();
+            } else {
+                //optimistic success
+                inodeTable.put(newInodeNumber, newInode);
+            }
+
+            //TODO - update timestamps size and nlinks on parent
+
+            res.status = nfsstat.NFS_OK;
+            res.resok = new MKDIR3resok();
+            res.resok.obj_attributes = toPostOp(newInodeNumber, newInode);
+            res.resok.obj = toPostOpHandle(newInodeNumber);
+            res.resok.dir_wcc = new wcc_data();
+            res.resok.dir_wcc.before = parentPre;
+            res.resok.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+
+        } catch (ChimeraNFSException hne) {
+            res.status = hne.getStatus();
+            if (parentPre == null) {
+                res.resfail = CONST_MKDIR_FAIL_RES;
+            } else {
+                res.resfail = new MKDIR3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        } catch (Exception e) {
+            logger.error("mkdir", e);
+            res.status = nfsstat.NFSERR_SERVERFAULT;
+            if (parentPre == null) {
+                res.resfail = CONST_MKDIR_FAIL_RES;
+            } else {
+                res.resfail = new MKDIR3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        }
+
+        return res;
     }
 
     @Override
@@ -586,6 +689,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private final static READ3resfail CONST_READ_FAIL_RES = new READ3resfail();
     private final static WRITE3resfail CONST_WRITE_FAIL_RES = new WRITE3resfail();
     private final static CREATE3resfail CONST_CREATE_FAIL_RES = new CREATE3resfail();
+    private final static MKDIR3resfail CONST_MKDIR_FAIL_RES = new MKDIR3resfail();
 
     static {
         CONST_DEV.specdata1 = new uint32(666);
@@ -601,6 +705,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         CONST_READ_FAIL_RES.file_attributes = CONST_EMPTY_POSTOP;
         CONST_WRITE_FAIL_RES.file_wcc = CONST_EMPTY_WCC;
         CONST_CREATE_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
+        CONST_MKDIR_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
     }
 
     private pre_op_attr toPreAttr(SillyInode inode) {
@@ -617,6 +722,13 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         post_op_attr result = new post_op_attr();
         result.attributes_follow = true;
         result.attributes = toAttr(inodeNumber, inode);
+        return result;
+    }
+
+    private post_op_fh3 toPostOpHandle(long inodeNumber) {
+        post_op_fh3 result = new post_op_fh3();
+        result.handle_follows = true;
+        result.handle = toHandle(inodeNumber);
         return result;
     }
 
@@ -637,7 +749,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         return result;
     }
 
-    private nfs_fh3 toHandle(long inodeNumber, SillyInode inode) {
+    private nfs_fh3 toHandle(long inodeNumber) {
         nfs_fh3 result = new nfs_fh3();
         result.data = SillyInodeReference.produceFor(inodeNumber);
         return result;
