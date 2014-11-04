@@ -63,6 +63,7 @@ import org.dcache.nfs.v3.xdr.MKDIR3resfail;
 import org.dcache.nfs.v3.xdr.MKDIR3resok;
 import org.dcache.nfs.v3.xdr.MKNOD3args;
 import org.dcache.nfs.v3.xdr.MKNOD3res;
+import org.dcache.nfs.v3.xdr.MKNOD3resfail;
 import org.dcache.nfs.v3.xdr.PATHCONF3args;
 import org.dcache.nfs.v3.xdr.PATHCONF3res;
 import org.dcache.nfs.v3.xdr.READ3args;
@@ -88,6 +89,7 @@ import org.dcache.nfs.v3.xdr.SETATTR3resfail;
 import org.dcache.nfs.v3.xdr.SETATTR3resok;
 import org.dcache.nfs.v3.xdr.SYMLINK3args;
 import org.dcache.nfs.v3.xdr.SYMLINK3res;
+import org.dcache.nfs.v3.xdr.SYMLINK3resfail;
 import org.dcache.nfs.v3.xdr.WRITE3args;
 import org.dcache.nfs.v3.xdr.WRITE3res;
 import org.dcache.nfs.v3.xdr.WRITE3resfail;
@@ -121,6 +123,7 @@ import org.dcache.xdr.RpcCall;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static org.dcache.nfs.v3.HimeraNfsUtils.defaultWccData;
 import static org.dcache.nfs.v3.NameUtils.checkFilename;
 
 /**
@@ -399,8 +402,6 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         SillyInode parentInode = null;
         pre_op_attr parentPre = null;
         try {
-            int creationMode = arg1.how.mode;
-            String path = arg1.where.name.value;
             SillyInodeReference parentRef = new SillyInodeReference(arg1.where.dir.data);
             parentInodeNumber = parentRef.getInodeNumber();
             parentInode = resolve(parentRef);
@@ -410,6 +411,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             parentPre = toPreAttr(parentInode);
 
             //check names after we resolve parent so that we could fill in wcc data on failure result
+            String path = arg1.where.name.value;
             checkFilename(path);
             if (path.equals(".") || path.equals("..")) {
                 throw new ExistException();
@@ -425,6 +427,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             long accessTime;
             long modificationTime;
 
+            int creationMode = arg1.how.mode;
             switch (creationMode) {
                 case createmode3.UNCHECKED:
                 case createmode3.GUARDED:
@@ -513,8 +516,6 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         SillyInode parentInode = null;
         pre_op_attr parentPre = null;
         try {
-            String path = arg1.where.name.value;
-
             SillyInodeReference parentRef = new SillyInodeReference(arg1.where.dir.data);
             parentInodeNumber = parentRef.getInodeNumber();
             parentInode = resolve(parentRef);
@@ -524,6 +525,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             parentPre = toPreAttr(parentInode);
 
             //check names after we resolve parent so that we could fill in wcc data on failure result
+            String path = arg1.where.name.value;
             checkFilename(path);
             if (path.equals(".") || path.equals("..")) {
                 throw new ExistException();
@@ -593,12 +595,70 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public SYMLINK3res NFSPROC3_SYMLINK_3(RpcCall call$, SYMLINK3args arg1) {
-        return null;
+        SYMLINK3res res = new SYMLINK3res();
+
+        long parentInodeNumber = -1;
+        SillyInode parentInode = null;
+        pre_op_attr parentPre = null;
+        try {
+            SillyInodeReference parentRef = new SillyInodeReference(arg1.where.dir.data);
+            parentInodeNumber = parentRef.getInodeNumber();
+            parentInode = resolve(parentRef);
+            parentPre = toPreAttr(parentInode);
+
+            //check names after we resolve parent so that we could fill in wcc data on failure result
+            String path = arg1.where.name.value;
+            checkFilename(path);
+            if (path.equals(".") || path.equals("..")) {
+                throw new ExistException();
+            }
+
+            String symlinkTargetPath = arg1.symlink.symlink_data.value;
+            sattr3 creationAttributes = arg1.symlink.symlink_attributes;
+            long serverTime = System.currentTimeMillis();
+            //noinspection OctalInteger
+            int mode = creationAttributes.mode.set_it ? creationAttributes.mode.mode.value.value&Stat.S_PERMS : 0644;
+            int uid = creationAttributes.uid.set_it ? creationAttributes.uid.uid.value.value : 0; //TODO - use caller
+            int gid = creationAttributes.gid.set_it ? creationAttributes.gid.gid.value.value : 0; //TODO - use caller
+            long size = 0; //symlinks have no size
+            long accessTime = creationAttributes.atime.set_it == time_how.SET_TO_CLIENT_TIME ? HimeraNfsUtils.convertTimestamp(creationAttributes.atime.atime) : serverTime;
+            long modificationTime = creationAttributes.mtime.set_it == time_how.SET_TO_CLIENT_TIME ? HimeraNfsUtils.convertTimestamp(creationAttributes.mtime.mtime) : serverTime;
+
+            //TODO - support this
+            throw new NotSuppException("symlinks not supported yet");
+
+        } catch (ChimeraNFSException hne) {
+            res.status = hne.getStatus();
+            if (parentPre == null) {
+                res.resfail = CONST_SYMLINK_FAIL_RES;
+            } else {
+                res.resfail = new SYMLINK3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        } catch (Exception e) {
+            logger.error("symlink", e);
+            res.status = nfsstat.NFSERR_SERVERFAULT;
+            if (parentPre == null) {
+                res.resfail = CONST_SYMLINK_FAIL_RES;
+            } else {
+                res.resfail = new SYMLINK3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        }
+
+        return res;
     }
 
     @Override
     public MKNOD3res NFSPROC3_MKNOD_3(RpcCall call$, MKNOD3args arg1) {
-        return null;
+        MKNOD3res res = new MKNOD3res();
+        res.status = nfsstat.NFSERR_NOTSUPP;
+        res.resfail = CONST_MKNOD_FAIL_RES;
+        return res;
     }
 
     @Override
@@ -690,6 +750,8 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private final static WRITE3resfail CONST_WRITE_FAIL_RES = new WRITE3resfail();
     private final static CREATE3resfail CONST_CREATE_FAIL_RES = new CREATE3resfail();
     private final static MKDIR3resfail CONST_MKDIR_FAIL_RES = new MKDIR3resfail();
+    private final static SYMLINK3resfail CONST_SYMLINK_FAIL_RES = new SYMLINK3resfail();
+    private final static MKNOD3resfail CONST_MKNOD_FAIL_RES = new MKNOD3resfail();
 
     static {
         CONST_DEV.specdata1 = new uint32(666);
@@ -706,6 +768,8 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         CONST_WRITE_FAIL_RES.file_wcc = CONST_EMPTY_WCC;
         CONST_CREATE_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_MKDIR_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
+        CONST_SYMLINK_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
+        CONST_MKNOD_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
     }
 
     private pre_op_attr toPreAttr(SillyInode inode) {
