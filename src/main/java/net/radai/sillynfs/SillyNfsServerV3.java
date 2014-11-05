@@ -79,6 +79,8 @@ import org.dcache.nfs.v3.xdr.READLINK3res;
 import org.dcache.nfs.v3.xdr.READLINK3resfail;
 import org.dcache.nfs.v3.xdr.REMOVE3args;
 import org.dcache.nfs.v3.xdr.REMOVE3res;
+import org.dcache.nfs.v3.xdr.REMOVE3resfail;
+import org.dcache.nfs.v3.xdr.REMOVE3resok;
 import org.dcache.nfs.v3.xdr.RENAME3args;
 import org.dcache.nfs.v3.xdr.RENAME3res;
 import org.dcache.nfs.v3.xdr.RMDIR3args;
@@ -663,7 +665,59 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public REMOVE3res NFSPROC3_REMOVE_3(RpcCall call$, REMOVE3args arg1) {
-        return null;
+        REMOVE3res res = new REMOVE3res();
+
+        long parentInodeNumber = -1;
+        SillyInode parentInode = null;
+        pre_op_attr parentPre = null;
+        try {
+            SillyInodeReference parentRef = new SillyInodeReference(arg1.object.dir.data);
+            parentInodeNumber = parentRef.getInodeNumber();
+            parentInode = resolve(parentRef);
+            if (!parentInode.isDirectory()) {
+                throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
+            }
+            parentPre = toPreAttr(parentInode);
+
+            String name = arg1.object.name.value; //dont bother checking validity. worst-case it wont be found
+            Long childInodeNumber = resolveChild(parentInodeNumber, name);
+            if (childInodeNumber == null) {
+                throw new NoEntException();
+            }
+            inodeTable.remove(childInodeNumber.longValue());
+
+            //TODO - update timestamps and size on parent
+
+            res.status = nfsstat.NFS_OK;
+            res.resok = new REMOVE3resok();
+            res.resok.dir_wcc = new wcc_data();
+            res.resok.dir_wcc.before = parentPre;
+            res.resok.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+
+        } catch (ChimeraNFSException hne) {
+            res.status = hne.getStatus();
+            if (parentPre == null) {
+                res.resfail = CONST_REMOVE_FAIL_RES;
+            } else {
+                res.resfail = new REMOVE3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        } catch (Exception e) {
+            logger.error("symlink", e);
+            res.status = nfsstat.NFSERR_SERVERFAULT;
+            if (parentPre == null) {
+                res.resfail = CONST_REMOVE_FAIL_RES;
+            } else {
+                res.resfail = new REMOVE3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        }
+
+        return res;
     }
 
     @Override
@@ -737,6 +791,14 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         return parentDirectoryEntry;
     }
 
+    private Long resolveChild(long directoryInodeNumber, String name) {
+        ConcurrentRadixTree<Long> parentDirectoryEntry = directoryTable.get(directoryInodeNumber);
+        if (parentDirectoryEntry == null) {
+            return null;
+        }
+        return parentDirectoryEntry.getValueForExactKey(name);
+    }
+
     private final static specdata3 CONST_DEV = new specdata3();
     private final static uint64 CONST_FS = new uint64(666);
     private final static pre_op_attr CONST_EMPTY_PREOP = new pre_op_attr();
@@ -752,6 +814,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private final static MKDIR3resfail CONST_MKDIR_FAIL_RES = new MKDIR3resfail();
     private final static SYMLINK3resfail CONST_SYMLINK_FAIL_RES = new SYMLINK3resfail();
     private final static MKNOD3resfail CONST_MKNOD_FAIL_RES = new MKNOD3resfail();
+    private final static REMOVE3resfail CONST_REMOVE_FAIL_RES = new REMOVE3resfail();
 
     static {
         CONST_DEV.specdata1 = new uint32(666);
@@ -770,6 +833,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         CONST_MKDIR_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_SYMLINK_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_MKNOD_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
+        CONST_REMOVE_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
     }
 
     private pre_op_attr toPreAttr(SillyInode inode) {
