@@ -32,6 +32,7 @@ import org.dcache.nfs.status.ExistException;
 import org.dcache.nfs.status.InvalException;
 import org.dcache.nfs.status.NoEntException;
 import org.dcache.nfs.status.NotDirException;
+import org.dcache.nfs.status.NotEmptyException;
 import org.dcache.nfs.status.NotSuppException;
 import org.dcache.nfs.v3.HimeraNfsUtils;
 import org.dcache.nfs.v3.xdr.ACCESS3args;
@@ -85,6 +86,8 @@ import org.dcache.nfs.v3.xdr.RENAME3args;
 import org.dcache.nfs.v3.xdr.RENAME3res;
 import org.dcache.nfs.v3.xdr.RMDIR3args;
 import org.dcache.nfs.v3.xdr.RMDIR3res;
+import org.dcache.nfs.v3.xdr.RMDIR3resfail;
+import org.dcache.nfs.v3.xdr.RMDIR3resok;
 import org.dcache.nfs.v3.xdr.SETATTR3args;
 import org.dcache.nfs.v3.xdr.SETATTR3res;
 import org.dcache.nfs.v3.xdr.SETATTR3resfail;
@@ -419,7 +422,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 throw new ExistException();
             }
 
-            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber);
+            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber, true);
 
             long serverTime = System.currentTimeMillis();
             int mode;
@@ -533,7 +536,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 throw new ExistException();
             }
 
-            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber);
+            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber, true);
 
             sattr3 creationAttributes = arg1.attributes;
             long serverTime = System.currentTimeMillis();
@@ -722,7 +725,82 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public RMDIR3res NFSPROC3_RMDIR_3(RpcCall call$, RMDIR3args arg1) {
-        return null;
+        RMDIR3res res = new RMDIR3res();
+
+        long parentInodeNumber = -1;
+        SillyInode parentInode = null;
+        pre_op_attr parentPre = null;
+        try {
+            SillyInodeReference parentRef = new SillyInodeReference(arg1.object.dir.data);
+            parentInodeNumber = parentRef.getInodeNumber();
+            parentInode = resolve(parentRef);
+            if (!parentInode.isDirectory()) {
+                throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
+            }
+            parentPre = toPreAttr(parentInode);
+
+            String name = arg1.object.name.value; //dont bother checking validity. worst-case it wont be found
+            if (name.equals(".")) {
+                //TODO - maybe treat this as an attempt to delete parent?
+                throw new InvalException();
+            }
+            if (name.equals("..")) {
+                throw new NotEmptyException(); //parent exists, so grandparent is by definition not empty.
+            }
+            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber, false);
+            if (parentDirectoryEntry == null) {
+                throw new NoEntException();
+            }
+            Long childInodeNumber = parentDirectoryEntry.getValueForExactKey(name);
+            if (childInodeNumber == null) {
+                throw new NoEntException();
+            }
+            long childInodeNumberPrimitive = childInodeNumber;
+            SillyInode childInode = resolve(childInodeNumberPrimitive);
+            if (!childInode.isDirectory()) {
+                throw new NotDirException("inode #" + childInodeNumber + " is not a directory");
+            }
+            long size = childInode.getSize();
+            if (size>0) {
+                throw new NotEmptyException();
+            }
+
+            parentDirectoryEntry.remove(name);
+            //TODO - striped lock array for directory operations
+            //cant remove parentDirectoryEntry if its empty because we might be in a race with a CREATE somewhere ...
+            inodeTable.remove(childInodeNumberPrimitive);
+            directoryTable.remove(childInodeNumberPrimitive);
+
+            res.status = nfsstat.NFS_OK;
+            res.resok = new RMDIR3resok();
+            res.resok.dir_wcc = new wcc_data();
+            res.resok.dir_wcc.before = parentPre;
+            res.resok.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+
+        } catch (ChimeraNFSException hne) {
+            res.status = hne.getStatus();
+            if (parentPre == null) {
+                res.resfail = CONST_RMDIR_FAIL_RES;
+            } else {
+                res.resfail = new RMDIR3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        } catch (Exception e) {
+            logger.error("symlink", e);
+            res.status = nfsstat.NFSERR_SERVERFAULT;
+            if (parentPre == null) {
+                res.resfail = CONST_RMDIR_FAIL_RES;
+            } else {
+                res.resfail = new RMDIR3resfail();
+                res.resfail.dir_wcc = new wcc_data();
+                res.resfail.dir_wcc.before = parentPre;
+                res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
+            }
+        }
+
+        return res;
     }
 
     @Override
@@ -781,9 +859,9 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         return inode;
     }
 
-    private ConcurrentRadixTree<Long> resolveDirectory(long inodeNumber) {
+    private ConcurrentRadixTree<Long> resolveDirectory(long inodeNumber, boolean createIfDoesntExist) {
         ConcurrentRadixTree<Long> parentDirectoryEntry = directoryTable.get(inodeNumber);
-        if (parentDirectoryEntry == null) {
+        if (parentDirectoryEntry == null && createIfDoesntExist) {
             parentDirectoryEntry = new ConcurrentRadixTree<>(directoryNodeFactory);
             ConcurrentRadixTree<Long> alreadyThere = directoryTable.putIfAbsent(inodeNumber, parentDirectoryEntry);
             return alreadyThere != null ? alreadyThere : parentDirectoryEntry;
@@ -815,6 +893,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private final static SYMLINK3resfail CONST_SYMLINK_FAIL_RES = new SYMLINK3resfail();
     private final static MKNOD3resfail CONST_MKNOD_FAIL_RES = new MKNOD3resfail();
     private final static REMOVE3resfail CONST_REMOVE_FAIL_RES = new REMOVE3resfail();
+    private final static RMDIR3resfail CONST_RMDIR_FAIL_RES = new RMDIR3resfail();
 
     static {
         CONST_DEV.specdata1 = new uint32(666);
@@ -834,6 +913,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         CONST_SYMLINK_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_MKNOD_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_REMOVE_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
+        CONST_RMDIR_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
     }
 
     private pre_op_attr toPreAttr(SillyInode inode) {
