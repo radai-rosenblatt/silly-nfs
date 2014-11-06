@@ -19,6 +19,7 @@
 
 package net.radai.sillynfs;
 
+import com.google.common.util.concurrent.Striped;
 import com.googlecode.concurrenttrees.radix.ConcurrentRadixTree;
 import com.googlecode.concurrenttrees.radix.node.NodeFactory;
 import com.googlecode.concurrenttrees.radix.node.concrete.SmartArrayBasedNodeFactory;
@@ -127,6 +128,7 @@ import org.dcache.xdr.RpcCall;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
 
 import static org.dcache.nfs.v3.HimeraNfsUtils.defaultWccData;
 import static org.dcache.nfs.v3.NameUtils.checkFilename;
@@ -142,6 +144,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private static final Logger logger = LogManager.getLogger(SillyNfsServerV3.class);
 
     private AtomicLong inodeSequence = new AtomicLong(0);
+    private Striped<Lock> locks = Striped.lock(64); //TODO - function of #cores
     private NonBlockingHashMapLong<SillyInode> inodeTable = new NonBlockingHashMapLong<>(false);
     private NonBlockingHashMapLong<ConcurrentRadixTree<Long>> directoryTable = new NonBlockingHashMapLong<>();
     private NodeFactory directoryNodeFactory = new SmartArrayBasedNodeFactory();
@@ -414,6 +417,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
             }
             parentPre = toPreAttr(parentInode);
+            long modCountBefore = parentInode.getModCount();
 
             //check names after we resolve parent so that we could fill in wcc data on failure result
             String path = arg1.where.name.value;
@@ -451,33 +455,51 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                     throw new IllegalStateException();
             }
 
-            //optimistic approach - create the new inode, try inserting it.
-            long newInodeNumber = inodeSequence.incrementAndGet();
-            SillyInode newInode = createInode(newInodeNumber, parentInodeNumber, mode, Stat.Type.REGULAR, uid, gid, size, accessTime, modificationTime);
-            Long existingInodeNumber = parentDirectoryEntry.putIfAbsent(path, newInodeNumber);
-            if (existingInodeNumber != null) {
-                //optimistic failure
-                switch (creationMode) {
-                    case createmode3.UNCHECKED:
-                        //bonus points - attempt to reclaim inode number
-                        inodeSequence.compareAndSet(newInodeNumber, newInodeNumber-1);
-                        //TODO - apply creationAttributes to existing inode in this case?
-                        newInode = inodeTable.get(existingInodeNumber);
-                        newInodeNumber = existingInodeNumber;
-                        break;
-                    case createmode3.GUARDED:
-                        //bonus points - attempt to reclaim inode number
-                        inodeSequence.compareAndSet(newInodeNumber, newInodeNumber-1);
-                        throw new ExistException();
-                    case createmode3.EXCLUSIVE:
-                        throw new NotSuppException("exclusive file creation not implemented yet");
-                }
-            } else {
-                //optimistic success
-                inodeTable.put(newInodeNumber, newInode);
-            }
+            long newInodeNumber;
+            SillyInode newInode;
 
-            //TODO - update timestamps and size on parent
+            Lock parentLock = locks.get(parentInodeNumber);
+
+            parentLock.lock();
+            try {
+                long modCountNow = parentInode.getModCount();
+                if (modCountNow != modCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+
+                //optimistic approach - create the new inode, try inserting it.
+                newInodeNumber = inodeSequence.incrementAndGet();
+                newInode = createInode(newInodeNumber, parentInodeNumber, mode, Stat.Type.REGULAR, uid, gid, size, accessTime, modificationTime);
+
+                Long existingInodeNumber = parentDirectoryEntry.putIfAbsent(path, newInodeNumber);
+                if (existingInodeNumber != null) {
+                    //optimistic failure
+                    switch (creationMode) {
+                        case createmode3.UNCHECKED:
+                            //bonus points - attempt to reclaim inode number
+                            inodeSequence.compareAndSet(newInodeNumber, newInodeNumber-1);
+                            //TODO - apply creationAttributes to existing inode in this case?
+                            newInode = inodeTable.get(existingInodeNumber);
+                            newInodeNumber = existingInodeNumber;
+                            break;
+                        case createmode3.GUARDED:
+                            //bonus points - attempt to reclaim inode number
+                            inodeSequence.compareAndSet(newInodeNumber, newInodeNumber-1);
+                            throw new ExistException();
+                        case createmode3.EXCLUSIVE:
+                            throw new NotSuppException("exclusive file creation not implemented yet");
+                    }
+                } else {
+                    //optimistic success
+                    inodeTable.put(newInodeNumber, newInode);
+                }
+
+                //TODO - update timestamps, size and modCount on parent
+
+            } finally {
+                parentLock.unlock();
+            }
 
             res.status = nfsstat.NFS_OK;
             res.resok = new CREATE3resok();
