@@ -341,17 +341,13 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             long offset = arg1.offset.value.value;
             int count = arg1.count.value.value;
             byte[] data = new byte[count];
+
             int bytesRead = blobStore.read(inodeRef.getInodeNumber(), data, offset, count);
+            //TODO - update timestamps
 
             res.resok = new READ3resok();
-
-            if (bytesRead == count) {
-                res.resok.data = data;
-            } else {
-                res.resok.data = new byte[bytesRead];
-                System.arraycopy(data, 0, res.resok.data, 0, bytesRead);
-            }
-
+            res.resok.data = data;
+            res.resok.count = new count3(new uint32(bytesRead));
             res.resok.eof = bytesRead + offset == inode.getSize();
             res.resok.file_attributes = toPostOp(inodeRef.getInodeNumber(), inode);
 
@@ -384,6 +380,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             res.resok.file_wcc.before = toPreAttr(inode);
 
             int bytesWritten = blobStore.write(inodeRef.getInodeNumber(), data, offset, count);
+            //TODO - update timestamps and size
 
             res.resok.count = new count3(new uint32(bytesWritten));
             res.resok.committed = stable_how.FILE_SYNC; //which is of course a lie
@@ -459,7 +456,6 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             SillyInode newInode;
 
             Lock parentLock = locks.get(parentInodeNumber);
-
             parentLock.lock();
             try {
                 long modCountNow = parentInode.getModCount();
@@ -550,6 +546,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
             }
             parentPre = toPreAttr(parentInode);
+            long modCountBefore = parentInode.getModCount();
 
             //check names after we resolve parent so that we could fill in wcc data on failure result
             String path = arg1.where.name.value;
@@ -570,21 +567,37 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             long accessTime = creationAttributes.atime.set_it == time_how.SET_TO_CLIENT_TIME ? HimeraNfsUtils.convertTimestamp(creationAttributes.atime.atime) : serverTime;
             long modificationTime = creationAttributes.mtime.set_it == time_how.SET_TO_CLIENT_TIME ? HimeraNfsUtils.convertTimestamp(creationAttributes.mtime.mtime) : serverTime;
 
-            //optimistic approach - create the new inode, try inserting it.
-            long newInodeNumber = inodeSequence.incrementAndGet();
-            SillyInode newInode = createInode(newInodeNumber, parentInodeNumber, mode, Stat.Type.DIRECTORY, uid, gid, size, accessTime, modificationTime);
-            Long existingInodeNumber = parentDirectoryEntry.putIfAbsent(path, newInodeNumber);
-            if (existingInodeNumber != null) {
-                //optimistic failure
-                //bonus points - attempt to reclaim inode number
-                inodeSequence.compareAndSet(newInodeNumber, newInodeNumber-1);
-                throw new ExistException();
-            } else {
-                //optimistic success
-                inodeTable.put(newInodeNumber, newInode);
-            }
+            long newInodeNumber;
+            SillyInode newInode;
 
-            //TODO - update timestamps size and nlinks on parent
+            Lock parentLock = locks.get(parentInodeNumber);
+            parentLock.lock();
+            try {
+                long modCountNow = parentInode.getModCount();
+                if (modCountNow != modCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+
+                //optimistic approach - create the new inode, try inserting it.
+                newInodeNumber = inodeSequence.incrementAndGet();
+                newInode = createInode(newInodeNumber, parentInodeNumber, mode, Stat.Type.DIRECTORY, uid, gid, size, accessTime, modificationTime);
+                Long existingInodeNumber = parentDirectoryEntry.putIfAbsent(path, newInodeNumber);
+                if (existingInodeNumber != null) {
+                    //optimistic failure
+                    //bonus points - attempt to reclaim inode number
+                    inodeSequence.compareAndSet(newInodeNumber, newInodeNumber - 1);
+                    throw new ExistException();
+                } else {
+                    //optimistic success
+                    inodeTable.put(newInodeNumber, newInode);
+                }
+
+                //TODO - update timestamps size and nlinks on parent
+
+            } finally {
+                parentLock.unlock();
+            }
 
             res.status = nfsstat.NFS_OK;
             res.resok = new MKDIR3resok();
@@ -682,6 +695,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public MKNOD3res NFSPROC3_MKNOD_3(RpcCall call$, MKNOD3args arg1) {
+        //TODO - support this?!
         MKNOD3res res = new MKNOD3res();
         res.status = nfsstat.NFSERR_NOTSUPP;
         res.resfail = CONST_MKNOD_FAIL_RES;
@@ -703,15 +717,39 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
             }
             parentPre = toPreAttr(parentInode);
+            long modCountBefore = parentInode.getModCount();
 
             String name = arg1.object.name.value; //dont bother checking validity. worst-case it wont be found
-            Long childInodeNumber = resolveChild(parentInodeNumber, name);
+            ConcurrentRadixTree<Long> parentDirectoryEntry = resolveDirectory(parentInodeNumber, false);
+            Long childInodeNumber = parentDirectoryEntry == null ? null : parentDirectoryEntry.getValueForExactKey(name);
             if (childInodeNumber == null) {
                 throw new NoEntException();
             }
-            inodeTable.remove(childInodeNumber.longValue());
 
-            //TODO - update timestamps and size on parent
+            Lock parentLock = locks.get(parentInodeNumber);
+            parentLock.lock();
+            try {
+                long modCountNow = parentInode.getModCount();
+                if (modCountNow != modCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+
+                inodeTable.remove(childInodeNumber.longValue());
+
+                //TODO - update timestamps and size on parent
+
+                if (parentInode.getSize()==0) {
+                    //last child removed
+                    assert (parentDirectoryEntry.size()==0);
+                    if (parentDirectoryEntry != directoryTable.remove(parentInodeNumber)) {
+                        throw new IllegalStateException("should never happen");
+                    }
+                }
+
+            } finally {
+                parentLock.unlock();
+            }
 
             res.status = nfsstat.NFS_OK;
             res.resok = new REMOVE3resok();
