@@ -23,6 +23,7 @@ import com.google.common.util.concurrent.Striped;
 import com.googlecode.concurrenttrees.radix.ConcurrentRadixTree;
 import com.googlecode.concurrenttrees.radix.node.NodeFactory;
 import com.googlecode.concurrenttrees.radix.node.concrete.SmartArrayBasedNodeFactory;
+import net.radai.sillynfs.util.AutoCloseableLocks;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
@@ -127,6 +128,7 @@ import org.dcache.nfs.vfs.Stat;
 import org.dcache.xdr.RpcCall;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 
@@ -798,6 +800,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 throw new NotDirException("inode #" + parentInodeNumber + " is not a directory");
             }
             parentPre = toPreAttr(parentInode);
+            long parentModCountBefore = parentInode.getModCount();
 
             String name = arg1.object.name.value; //dont bother checking validity. worst-case it wont be found
             if (name.equals(".")) {
@@ -820,16 +823,37 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
             if (!childInode.isDirectory()) {
                 throw new NotDirException("inode #" + childInodeNumber + " is not a directory");
             }
+            long childModCountBefore = childInode.getModCount();
             long size = childInode.getSize();
             if (size>0) {
                 throw new NotEmptyException();
             }
 
-            parentDirectoryEntry.remove(name);
-            //TODO - striped lock array for directory operations
-            //cant remove parentDirectoryEntry if its empty because we might be in a race with a CREATE somewhere ...
-            inodeTable.remove(childInodeNumberPrimitive);
-            directoryTable.remove(childInodeNumberPrimitive);
+            //noinspection UnusedDeclaration
+            try (AutoCloseableLocks locksHeld = new AutoCloseableLocks(locks.bulkGet(Arrays.asList(parentInodeNumber, childInodeNumber)))) {
+                long parentModCountNow = parentInode.getModCount();
+                if (parentModCountNow != parentModCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+                long childModCountNow = childInode.getModCount();
+                if (childModCountNow != childModCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+
+                parentDirectoryEntry.remove(name);
+                //TODO - update timestamps and size on parent
+                if (parentInode.getSize()==0) {
+                    //last child removed
+                    assert (parentDirectoryEntry.size()==0);
+                    if (parentDirectoryEntry != directoryTable.remove(parentInodeNumber)) {
+                        throw new IllegalStateException("should never happen");
+                    }
+                }
+                inodeTable.remove(childInodeNumberPrimitive);
+                directoryTable.remove(childInodeNumberPrimitive);
+            }
 
             res.status = nfsstat.NFS_OK;
             res.resok = new RMDIR3resok();
