@@ -86,6 +86,8 @@ import org.dcache.nfs.v3.xdr.REMOVE3resfail;
 import org.dcache.nfs.v3.xdr.REMOVE3resok;
 import org.dcache.nfs.v3.xdr.RENAME3args;
 import org.dcache.nfs.v3.xdr.RENAME3res;
+import org.dcache.nfs.v3.xdr.RENAME3resfail;
+import org.dcache.nfs.v3.xdr.RENAME3resok;
 import org.dcache.nfs.v3.xdr.RMDIR3args;
 import org.dcache.nfs.v3.xdr.RMDIR3res;
 import org.dcache.nfs.v3.xdr.RMDIR3resfail;
@@ -128,11 +130,11 @@ import org.dcache.nfs.vfs.Stat;
 import org.dcache.xdr.RpcCall;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 
-import static org.dcache.nfs.v3.HimeraNfsUtils.defaultWccData;
 import static org.dcache.nfs.v3.NameUtils.checkFilename;
 
 /**
@@ -889,7 +891,175 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public RENAME3res NFSPROC3_RENAME_3(RpcCall call$, RENAME3args arg1) {
-        return null;
+        RENAME3res res = new RENAME3res();
+
+        long sourceInodeNumber = -1;
+        SillyInode sourceInode = null;
+        pre_op_attr sourcePre = null;
+        long destinationInodeNumber = -1;
+        SillyInode destinationInode = null;
+        pre_op_attr destinationPre = null;
+
+        try {
+            SillyInodeReference sourceRef = new SillyInodeReference(arg1.from.dir.data);
+            sourceInodeNumber = sourceRef.getInodeNumber();
+            sourceInode = resolve(sourceRef);
+            if (!sourceInode.isDirectory()) {
+                throw new NotDirException("inode #" + sourceInodeNumber + " is not a directory");
+            }
+            sourcePre = toPreAttr(sourceInode);
+            long sourceModCountBefore = sourceInode.getModCount();
+
+            String sourceName = arg1.from.name.value; //dont bother checking validity. worst-case it wont be found
+            if (sourceName.equals(".")) {
+                throw new InvalException();
+            }
+            if (sourceName.equals("..")) {
+                throw new InvalException();
+            }
+            ConcurrentRadixTree<Long> sourceDirectoryEntry = resolveDirectory(sourceInodeNumber, false);
+            if (sourceDirectoryEntry == null) {
+                throw new NoEntException();
+            }
+            Long targetInodeNumber = sourceDirectoryEntry.getValueForExactKey(sourceName);
+            if (targetInodeNumber == null) {
+                throw new NoEntException();
+            }
+            long targetInodeNumberPrimitive = targetInodeNumber;
+            SillyInode targetInode = resolve(targetInodeNumberPrimitive);
+
+            SillyInodeReference destinationRef = new SillyInodeReference(arg1.to.dir.data);
+            destinationInodeNumber = destinationRef.getInodeNumber();
+            //TODO - handle case where source==destination inodes
+            destinationInode = resolve(destinationRef);
+            if (!destinationInode.isDirectory()) {
+                throw new NotDirException("inode #" + destinationInodeNumber + " is not a directory");
+            }
+            destinationPre = toPreAttr(destinationInode);
+            long destinationModCountBefore = destinationInode.getModCount();
+
+            String targetName = arg1.to.name.value;
+            if (targetName.equals(".")) {
+                throw new InvalException();
+            }
+            if (targetName.equals("..")) {
+                throw new InvalException();
+            }
+            checkFilename(targetName);
+            ConcurrentRadixTree<Long> destinationDirectoryEntry = resolveDirectory(destinationInodeNumber, true);
+
+            Long existingTargetInodeNumber = destinationDirectoryEntry.getValueForExactKey(targetName);
+            SillyInode existingTargetInode = null;
+            long existingTargetModCountBefore = -1;
+            if (existingTargetInodeNumber != null) {
+                existingTargetInode = resolve(existingTargetInodeNumber);
+                if (targetInode.isDirectory()) {
+                    if (!existingTargetInode.isDirectory() || existingTargetInode.getSize()!=0) {
+                        throw new ExistException();
+                    }
+                    //existing target is an empty directory. spec calls this "compatible"
+                } else if (existingTargetInode.isDirectory()) { //TODO - handle symlinks
+                    throw new ExistException();
+                }
+                existingTargetModCountBefore = existingTargetInode.getModCount();
+            }
+
+            ArrayList<Long> locksToObtain = new ArrayList<>(3); //worst-case size
+            locksToObtain.add(sourceInodeNumber);
+            locksToObtain.add(destinationInodeNumber);
+            if (existingTargetInodeNumber!=null) {
+                locksToObtain.add(existingTargetInodeNumber);
+            }
+
+            //noinspection UnusedDeclaration
+            try (AutoCloseableLocks locksHeld = new AutoCloseableLocks(locks.bulkGet(locksToObtain))) {
+                long sourceModCountNow = sourceInode.getModCount();
+                if (sourceModCountNow != sourceModCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+                long destinationModCountNow = destinationInode.getModCount();
+                if (destinationModCountNow != destinationModCountBefore) {
+                    //TODO - recheck invariants
+                    throw new UnsupportedOperationException("TBD");
+                }
+                if (existingTargetInode!=null) {
+                    long existingTargetModCountNow = existingTargetInode.getModCount();
+                    if (existingTargetModCountNow != existingTargetModCountBefore) {
+                        //TODO - recheck invariants
+                        throw new UnsupportedOperationException("TBD");
+                    }
+                }
+
+                sourceDirectoryEntry.remove(sourceName);
+                if (existingTargetInode!=null) {
+                    destinationDirectoryEntry.remove(targetName);
+                    inodeTable.remove(existingTargetInodeNumber.longValue());
+                    //TODO - update existing target modCount (to make concurrent processes fail)
+                }
+                //TODO - update source inode size modCount and timestamps
+                if (sourceInode.getSize() == 0) {
+                    assert (sourceDirectoryEntry.size()==0);
+                    if (sourceDirectoryEntry != directoryTable.remove(sourceInodeNumber)) {
+                        throw new IllegalStateException("should never happen");
+                    }
+
+                }
+                destinationDirectoryEntry.put(targetName, targetInodeNumber);
+                //TODO - update destination inode size modCount and timestamps
+                //TODO - update target inode as well?
+            }
+
+            res.status = nfsstat.NFS_OK;
+            res.resok = new RENAME3resok();
+            res.resok.fromdir_wcc = new wcc_data();
+            res.resok.fromdir_wcc.before = sourcePre;
+            res.resok.fromdir_wcc.after = toPostOp(sourceInodeNumber, sourceInode);
+            res.resok.todir_wcc = new wcc_data();
+            res.resok.todir_wcc.before = destinationPre;
+            res.resok.todir_wcc.after = toPostOp(destinationInodeNumber, destinationInode);
+
+        } catch (ChimeraNFSException hne) {
+            res.status = hne.getStatus();
+            if (sourcePre == null && destinationPre == null) {
+                res.resfail = CONST_RENAME_FAIL_RES;
+            } else {
+                res.resfail = new RENAME3resfail();
+                if (sourcePre!=null) {
+                    res.resfail.fromdir_wcc = new wcc_data();
+                    res.resfail.fromdir_wcc.before = sourcePre;
+                    res.resfail.fromdir_wcc.after = toPostOp(sourceInodeNumber, sourceInode);
+                } else {
+                    res.resfail.fromdir_wcc = CONST_EMPTY_WCC;
+                }
+                if (destinationPre!=null) {
+                    res.resfail.todir_wcc = new wcc_data();
+                    res.resfail.todir_wcc.before = destinationPre;
+                    res.resfail.todir_wcc.after = toPostOp(destinationInodeNumber, destinationInode);
+                }
+            }
+        } catch (Exception e) {
+            logger.error("symlink", e);
+            res.status = nfsstat.NFSERR_SERVERFAULT;
+            if (sourcePre == null && destinationPre == null) {
+                res.resfail = CONST_RENAME_FAIL_RES;
+            } else {
+                res.resfail = new RENAME3resfail();
+                if (sourcePre!=null) {
+                    res.resfail.fromdir_wcc = new wcc_data();
+                    res.resfail.fromdir_wcc.before = sourcePre;
+                    res.resfail.fromdir_wcc.after = toPostOp(sourceInodeNumber, sourceInode);
+                } else {
+                    res.resfail.fromdir_wcc = CONST_EMPTY_WCC;
+                }
+                if (destinationPre!=null) {
+                    res.resfail.todir_wcc = new wcc_data();
+                    res.resfail.todir_wcc.before = destinationPre;
+                    res.resfail.todir_wcc.after = toPostOp(destinationInodeNumber, destinationInode);
+                }
+            }
+        }
+        return res;
     }
 
     @Override
@@ -978,6 +1148,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private final static MKNOD3resfail CONST_MKNOD_FAIL_RES = new MKNOD3resfail();
     private final static REMOVE3resfail CONST_REMOVE_FAIL_RES = new REMOVE3resfail();
     private final static RMDIR3resfail CONST_RMDIR_FAIL_RES = new RMDIR3resfail();
+    private final static RENAME3resfail CONST_RENAME_FAIL_RES = new RENAME3resfail();
 
     static {
         CONST_DEV.specdata1 = new uint32(666);
@@ -998,6 +1169,8 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         CONST_MKNOD_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_REMOVE_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_RMDIR_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
+        CONST_RENAME_FAIL_RES.fromdir_wcc = CONST_EMPTY_WCC;
+        CONST_RENAME_FAIL_RES.todir_wcc = CONST_EMPTY_WCC;
     }
 
     private pre_op_attr toPreAttr(SillyInode inode) {
