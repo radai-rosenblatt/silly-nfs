@@ -20,6 +20,7 @@
 package net.radai.sillynfs;
 
 import com.google.common.util.concurrent.Striped;
+import com.googlecode.concurrenttrees.common.KeyValuePair;
 import com.googlecode.concurrenttrees.radix.ConcurrentRadixTree;
 import com.googlecode.concurrenttrees.radix.node.NodeFactory;
 import com.googlecode.concurrenttrees.radix.node.concrete.SmartArrayBasedNodeFactory;
@@ -29,6 +30,7 @@ import org.apache.logging.log4j.Logger;
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
 import org.dcache.nfs.ChimeraNFSException;
 import org.dcache.nfs.nfsstat;
+import org.dcache.nfs.status.BadCookieException;
 import org.dcache.nfs.status.BadHandleException;
 import org.dcache.nfs.status.ExistException;
 import org.dcache.nfs.status.InvalException;
@@ -56,6 +58,7 @@ import org.dcache.nfs.v3.xdr.GETATTR3res;
 import org.dcache.nfs.v3.xdr.GETATTR3resok;
 import org.dcache.nfs.v3.xdr.LINK3args;
 import org.dcache.nfs.v3.xdr.LINK3res;
+import org.dcache.nfs.v3.xdr.LINK3resfail;
 import org.dcache.nfs.v3.xdr.LOOKUP3args;
 import org.dcache.nfs.v3.xdr.LOOKUP3res;
 import org.dcache.nfs.v3.xdr.LOOKUP3resfail;
@@ -75,6 +78,7 @@ import org.dcache.nfs.v3.xdr.READ3resfail;
 import org.dcache.nfs.v3.xdr.READ3resok;
 import org.dcache.nfs.v3.xdr.READDIR3args;
 import org.dcache.nfs.v3.xdr.READDIR3res;
+import org.dcache.nfs.v3.xdr.READDIR3resfail;
 import org.dcache.nfs.v3.xdr.READDIRPLUS3args;
 import org.dcache.nfs.v3.xdr.READDIRPLUS3res;
 import org.dcache.nfs.v3.xdr.READLINK3args;
@@ -103,6 +107,7 @@ import org.dcache.nfs.v3.xdr.WRITE3args;
 import org.dcache.nfs.v3.xdr.WRITE3res;
 import org.dcache.nfs.v3.xdr.WRITE3resfail;
 import org.dcache.nfs.v3.xdr.WRITE3resok;
+import org.dcache.nfs.v3.xdr.cookieverf3;
 import org.dcache.nfs.v3.xdr.count3;
 import org.dcache.nfs.v3.xdr.createmode3;
 import org.dcache.nfs.v3.xdr.fattr3;
@@ -126,12 +131,14 @@ import org.dcache.nfs.v3.xdr.uint64;
 import org.dcache.nfs.v3.xdr.wcc_attr;
 import org.dcache.nfs.v3.xdr.wcc_data;
 import org.dcache.nfs.v3.xdr.writeverf3;
+import org.dcache.nfs.vfs.DirectoryEntry;
 import org.dcache.nfs.vfs.Stat;
 import org.dcache.xdr.RpcCall;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 
@@ -772,7 +779,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
             }
         } catch (Exception e) {
-            logger.error("symlink", e);
+            logger.error("remove", e);
             res.status = nfsstat.NFSERR_SERVERFAULT;
             if (parentPre == null) {
                 res.resfail = CONST_REMOVE_FAIL_RES;
@@ -874,7 +881,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 res.resfail.dir_wcc.after = toPostOp(parentInodeNumber, parentInode);
             }
         } catch (Exception e) {
-            logger.error("symlink", e);
+            logger.error("rmdir", e);
             res.status = nfsstat.NFSERR_SERVERFAULT;
             if (parentPre == null) {
                 res.resfail = CONST_RMDIR_FAIL_RES;
@@ -1039,7 +1046,7 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
                 }
             }
         } catch (Exception e) {
-            logger.error("symlink", e);
+            logger.error("rename", e);
             res.status = nfsstat.NFSERR_SERVERFAULT;
             if (sourcePre == null && destinationPre == null) {
                 res.resfail = CONST_RENAME_FAIL_RES;
@@ -1064,12 +1071,71 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
 
     @Override
     public LINK3res NFSPROC3_LINK_3(RpcCall call$, LINK3args arg1) {
-        return null;
+        LINK3res res = new LINK3res();
+        res.status = nfsstat.NFSERR_NOTSUPP;
+        res.resfail = CONST_LINK_FAIL_RES;
+        return res;
     }
 
     @Override
     public READDIR3res NFSPROC3_READDIR_3(RpcCall call$, READDIR3args arg1) {
-        return null;
+        READDIR3res res = new READDIR3res();
+
+        long inodeNumber = -1;
+        SillyInode inode = null;
+        pre_op_attr pre = null;
+
+        try {
+            SillyInodeReference ref = new SillyInodeReference(arg1.dir.data);
+            inodeNumber = ref.getInodeNumber();
+            inode = resolve(ref);
+            if (!inode.isDirectory()) {
+                throw new NotDirException("inode #" + inodeNumber + " is not a directory");
+            }
+
+            long cookie = arg1.cookie.value.value;
+            cookieverf3 verifier = arg1.cookieverf;
+            long inodeModCount = inode.getModCount();
+            if (cookie != 0) {
+                long verifierModCount = ByteBuffer.wrap(verifier.value).getLong();
+                if (verifierModCount != inodeModCount) {
+                    throw new BadCookieException("readdir verifier is "+verifier+" inode modCount is "+inodeModCount);
+                }
+            } else {
+                byte[] verifierData = new byte[nfs3_prot.NFS3_COOKIEVERFSIZE];
+                ByteBuffer.wrap(verifierData).putLong(inodeModCount);
+                verifier = new cookieverf3(verifierData);
+            }
+
+            ConcurrentRadixTree<Long> directoryTree = resolveDirectory(inodeNumber, false);
+            List<DirectoryEntry> dentries = new ArrayList<>((int) inode.getSize());
+            for (KeyValuePair<Long> keyValuePair : directoryTree.getKeyValuePairsForKeysStartingWith("")) {
+                CharSequence path = keyValuePair.getKey();
+                Long childInodeNumber = keyValuePair.getValue();
+                SillyInode
+                dentries.add(new DirectoryEntry(path.toString(), ))
+            }
+
+
+        } catch (ChimeraNFSException hne) {
+            res.status = hne.getStatus();
+            if (inode == null) {
+                res.resfail = CONST_READDIR_FAIL_RES;
+            } else {
+                res.resfail = new READDIR3resfail();
+                res.resfail.dir_attributes = toPostOp(inodeNumber, inode);
+            }
+        } catch (Exception e) {
+            logger.error("readdir", e);
+            res.status = nfsstat.NFSERR_SERVERFAULT;
+            if (inode == null) {
+                res.resfail = CONST_READDIR_FAIL_RES;
+            } else {
+                res.resfail = new READDIR3resfail();
+                res.resfail.dir_attributes = toPostOp(inodeNumber, inode);
+            }
+        }
+        return res;
     }
 
     @Override
@@ -1149,6 +1215,8 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
     private final static REMOVE3resfail CONST_REMOVE_FAIL_RES = new REMOVE3resfail();
     private final static RMDIR3resfail CONST_RMDIR_FAIL_RES = new RMDIR3resfail();
     private final static RENAME3resfail CONST_RENAME_FAIL_RES = new RENAME3resfail();
+    private final static LINK3resfail CONST_LINK_FAIL_RES = new LINK3resfail();
+    private final static READDIR3resfail CONST_READDIR_FAIL_RES = new READDIR3resfail();
 
     static {
         CONST_DEV.specdata1 = new uint32(666);
@@ -1171,6 +1239,9 @@ public class SillyNfsServerV3 extends nfs3_protServerStub {
         CONST_RMDIR_FAIL_RES.dir_wcc = CONST_EMPTY_WCC;
         CONST_RENAME_FAIL_RES.fromdir_wcc = CONST_EMPTY_WCC;
         CONST_RENAME_FAIL_RES.todir_wcc = CONST_EMPTY_WCC;
+        CONST_LINK_FAIL_RES.file_attributes = CONST_EMPTY_POSTOP;
+        CONST_LINK_FAIL_RES.linkdir_wcc = CONST_EMPTY_WCC;
+        CONST_READDIR_FAIL_RES.dir_attributes = CONST_EMPTY_POSTOP;
     }
 
     private pre_op_attr toPreAttr(SillyInode inode) {
